@@ -1,20 +1,67 @@
+import os
 import pandas as pd
 import numpy as np
 from typing import List, Tuple
+from datetime import datetime
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from dotenv import load_dotenv
 
-# Import configuration from scalping_bot.py
-from scalping_bot import (
-    SYMBOL,
-    LEVERAGE,
-    INITIAL_INVESTMENT,
-    STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
-    SMA_PERIOD,
-    EMA_PERIOD,
-    MAX_TRADES_PER_CROSSOVER,
-    MAX_DAILY_TRADES,
-    COOLDOWN_PERIOD,
-)
+# Load environment variables
+load_dotenv()
+
+# Configuration
+SYMBOL = "BTCUSDT"
+LEVERAGE = 10
+INITIAL_INVESTMENT = 10  # USD
+STOP_LOSS_PCT = 0.002  # 0.2%
+TAKE_PROFIT_PCT = 0.004  # 0.4%
+SMA_PERIOD = 200
+EMA_PERIOD = 50
+MAX_TRADES_PER_CROSSOVER = 5
+MAX_DAILY_TRADES = 10
+COOLDOWN_PERIOD = 300  # 5 minutes in seconds
+
+# Initialize Binance client
+client = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_API_SECRET"))
+
+
+def load_historical_data(
+    symbol: str, interval: str, start_date: str, end_date: str
+) -> pd.DataFrame:
+    """Fetch historical data from Binance."""
+    try:
+        klines = client.futures_historical_klines(
+            symbol=symbol, interval=interval, start_str=start_date, end_str=end_date
+        )
+
+        df = pd.DataFrame(
+            klines,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "number_of_trades",
+                "taker_buy_base_asset_volume",
+                "taker_buy_quote_asset_volume",
+                "ignore",
+            ],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+        df = df[["open", "high", "low", "close", "volume"]]
+        df = df.astype(float)
+
+        return df
+
+    except BinanceAPIException as e:
+        print(f"An error occurred: {e}")
+        return None
 
 
 def calculate_sma(data: pd.Series, period: int) -> pd.Series:
@@ -37,8 +84,8 @@ def simulate_trade(entry_price: float, exit_price: float, side: str) -> float:
 
 def backtest(data: pd.DataFrame) -> Tuple[float, int, int, List[float]]:
     """Backtest the scalping strategy."""
-    data["SMA"] = calculate_sma(data["Close"], SMA_PERIOD)
-    data["EMA"] = calculate_ema(data["Close"], EMA_PERIOD)
+    data["SMA"] = calculate_sma(data["close"], SMA_PERIOD)
+    data["EMA"] = calculate_ema(data["close"], EMA_PERIOD)
 
     trades = []
     trades_since_crossover = 0
@@ -64,10 +111,10 @@ def backtest(data: pd.DataFrame) -> Tuple[float, int, int, List[float]]:
             continue
 
         long_condition = (
-            data["Close"][i] > data["SMA"][i] and data["EMA"][i] > data["SMA"][i]
+            data["close"][i] > data["SMA"][i] and data["EMA"][i] > data["SMA"][i]
         )
         short_condition = (
-            data["Close"][i] < data["SMA"][i] and data["EMA"][i] < data["SMA"][i]
+            data["close"][i] < data["SMA"][i] and data["EMA"][i] < data["SMA"][i]
         )
 
         if long_condition and (
@@ -77,18 +124,18 @@ def backtest(data: pd.DataFrame) -> Tuple[float, int, int, List[float]]:
                 trades_since_crossover = 0
                 last_trend = "LONG"
 
-            entry_price = data["Close"][i]
+            entry_price = data["close"][i]
             take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
             stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
 
             for j in range(i + 1, len(data)):
-                if data["High"][j] >= take_profit_price:
+                if data["high"][j] >= take_profit_price:
                     profit = simulate_trade(entry_price, take_profit_price, "BUY")
                     total_profit += profit
                     trades.append(profit)
                     winning_trades += 1
                     break
-                elif data["Low"][j] <= stop_loss_price:
+                elif data["low"][j] <= stop_loss_price:
                     loss = simulate_trade(entry_price, stop_loss_price, "BUY")
                     total_profit += loss
                     trades.append(loss)
@@ -106,18 +153,18 @@ def backtest(data: pd.DataFrame) -> Tuple[float, int, int, List[float]]:
                 trades_since_crossover = 0
                 last_trend = "SHORT"
 
-            entry_price = data["Close"][i]
+            entry_price = data["close"][i]
             take_profit_price = entry_price * (1 - TAKE_PROFIT_PCT)
             stop_loss_price = entry_price * (1 + STOP_LOSS_PCT)
 
             for j in range(i + 1, len(data)):
-                if data["Low"][j] <= take_profit_price:
+                if data["low"][j] <= take_profit_price:
                     profit = simulate_trade(entry_price, take_profit_price, "SELL")
                     total_profit += profit
                     trades.append(profit)
                     winning_trades += 1
                     break
-                elif data["High"][j] >= stop_loss_price:
+                elif data["high"][j] >= stop_loss_price:
                     loss = simulate_trade(entry_price, stop_loss_price, "SELL")
                     total_profit += loss
                     trades.append(loss)
@@ -133,8 +180,14 @@ def backtest(data: pd.DataFrame) -> Tuple[float, int, int, List[float]]:
 
 def run_backtest():
     """Run the backtest and print results."""
-    # Load historical data (you need to implement this function)
+    print(f"Starting backtest for {SYMBOL}")
+
+    # Load historical data using Binance API
     data = load_historical_data(SYMBOL, "5m", "2023-01-01", "2023-04-30")
+
+    if data is None:
+        print("Failed to load historical data. Exiting.")
+        return
 
     total_profit, winning_trades, losing_trades, trades = backtest(data)
 
@@ -154,6 +207,10 @@ def run_backtest():
     print(f"Average daily return: {np.mean(daily_returns):.2%}")
     print(f"Maximum daily return: {max(daily_returns):.2%}")
     print(f"Minimum daily return: {min(daily_returns):.2%}")
+
+    # Calculate total return
+    total_return = (1 + total_profit) * INITIAL_INVESTMENT - INITIAL_INVESTMENT
+    print(f"Total return on ${INITIAL_INVESTMENT} investment: ${total_return:.2f}")
 
 
 if __name__ == "__main__":
